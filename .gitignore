@@ -1,0 +1,22 @@
+# Build output
+build/
+
+# vcpkg installed packages
+vcpkg_installed/
+
+# dotenv environment variables file
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Frontend build artifacts
+frontend/dist/
+frontend/node_modules/

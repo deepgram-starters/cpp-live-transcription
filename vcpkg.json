@@ -1,0 +1,12 @@
+{
+  "name": "cpp-live-transcription",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "crow",
+    "nlohmann-json",
+    "openssl",
+    "boost-beast",
+    "boost-asio",
+    "tomlplusplus"
+  ]
+}
