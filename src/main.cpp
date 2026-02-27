@@ -564,7 +564,8 @@ int main() {
     // WS /api/live-transcription - WebSocket proxy to Deepgram STT (auth required)
     // ========================================================================
     CROW_ROUTE(app, "/api/live-transcription")
-        .websocket()
+        .websocket(&app)
+        .mirrorprotocols()
         .onaccept([config_ptr](const crow::request& req, void** userdata) -> bool {
             std::cout << "WebSocket upgrade request for: /api/live-transcription" << std::endl;
 
@@ -623,24 +624,23 @@ int main() {
             auto dg_to_client_count = std::make_shared<std::atomic<int64_t>>(0);
             auto client_to_dg_count = std::make_shared<std::atomic<int64_t>>(0);
 
-            auto dg_ws = std::make_shared<websocket::stream<beast::ssl_stream<tcp::socket>>>(
-                net::io_context{}, ssl::context{ssl::context::tlsv12_client}
-            );
-
             // We need a persistent io_context, so allocate one
             auto ioc = std::make_shared<net::io_context>();
             auto ssl_ctx = std::make_shared<ssl::context>(ssl::context::tlsv12_client);
             ssl_ctx->set_default_verify_paths();
             ssl_ctx->set_verify_mode(ssl::verify_none); // Deepgram uses valid certs but simplify for starter
 
+            std::shared_ptr<websocket::stream<beast::ssl_stream<tcp::socket>>> dg_ws;
+
             try {
                 tcp::resolver resolver(*ioc);
                 auto results = resolver.resolve("api.deepgram.com", "443");
 
-                auto& beast_stream = beast::get_lowest_layer(
-                    *(dg_ws = std::make_shared<websocket::stream<beast::ssl_stream<tcp::socket>>>(
-                        *ioc, *ssl_ctx)));
-                beast_stream.connect(results);
+                tcp::socket raw_socket(*ioc);
+                boost::asio::connect(raw_socket, results);
+
+                beast::ssl_stream<tcp::socket> ssl_stream(std::move(raw_socket), *ssl_ctx);
+                dg_ws = std::make_shared<websocket::stream<beast::ssl_stream<tcp::socket>>>(std::move(ssl_stream));
 
                 // Set SNI hostname for TLS
                 if (!SSL_set_tlsext_host_name(dg_ws->next_layer().native_handle(), "api.deepgram.com")) {
@@ -729,7 +729,7 @@ int main() {
                 state->closed->store(true);
             }
         })
-        .onclose([](crow::websocket::connection& conn, const std::string& reason) {
+        .onclose([](crow::websocket::connection& conn, const std::string& reason, uint16_t) {
             std::cout << "Client disconnected from /api/live-transcription" << std::endl;
 
             struct ConnState {
@@ -748,10 +748,11 @@ int main() {
 
             state->closed->store(true);
 
-            // Close the Deepgram WebSocket connection
+            // Cancel the underlying socket to interrupt the read_thread,
+            // then let the read loop handle the close gracefully.
             std::cout << "Proxy session ending, closing connections" << std::endl;
             try {
-                state->dg_ws->close(websocket::close_code::normal);
+                beast::get_lowest_layer(*state->dg_ws).cancel();
             } catch (...) {}
 
             // Clean up (detached thread will exit on its own when closed flag is set)
