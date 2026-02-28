@@ -20,3 +20,6 @@ Thumbs.db
 # Frontend build artifacts
 frontend/dist/
 frontend/node_modules/
+
+# Playwright test results
+test-results/
