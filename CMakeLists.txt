@@ -18,3 +18,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     OpenSSL::Crypto
     Boost::system
 )
+
+# Crow otherwise uses standalone Asio, which conflicts with this Beast-based proxy.
+target_compile_definitions(${PROJECT_NAME} PRIVATE CROW_USE_BOOST)
