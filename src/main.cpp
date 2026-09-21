@@ -15,6 +15,8 @@
 #include <nlohmann/json.hpp>
 #include <toml++/toml.hpp>
 
+#include "deepgram_path.h"
+
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
@@ -339,46 +341,6 @@ static json load_metadata() {
 // ============================================================================
 // WEBSOCKET PROXY - Outbound connection to Deepgram via Boost.Beast
 // ============================================================================
-
-/// Builds the Deepgram WebSocket URL path with query parameters forwarded from the client request.
-static std::string build_deepgram_path(const std::string& query_string) {
-    // Parse incoming query params
-    std::map<std::string, std::string> params;
-    std::istringstream qs(query_string);
-    std::string pair;
-    while (std::getline(qs, pair, '&')) {
-        auto eq = pair.find('=');
-        if (eq != std::string::npos) {
-            params[pair.substr(0, eq)] = pair.substr(eq + 1);
-        }
-    }
-
-    // Defaults for Deepgram query parameters
-    std::vector<std::pair<std::string, std::string>> defaults = {
-        {"model",        "nova-3"},
-        {"language",     "en"},
-        {"smart_format", "true"},
-        {"punctuate",    "true"},
-        {"diarize",      "false"},
-        {"filler_words", "false"},
-        {"interim_results", "true"},
-        {"encoding",     "linear16"},
-        {"sample_rate",  "16000"},
-        {"channels",     "1"}
-    };
-
-    std::string path = "/v1/listen?";
-    bool first = true;
-    for (auto& [name, default_val] : defaults) {
-        auto it = params.find(name);
-        const std::string& val = (it != params.end()) ? it->second : default_val;
-        if (!first) path += "&";
-        path += name + "=" + val;
-        first = false;
-    }
-
-    return path;
-}
 
 /// Parses the Sec-WebSocket-Protocol header value into individual protocol strings.
 static std::vector<std::string> parse_subprotocols(const std::string& header_value) {

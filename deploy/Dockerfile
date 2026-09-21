@@ -42,10 +42,12 @@ ENV PATH="${VCPKG_ROOT}:${PATH}"
 WORKDIR /build
 COPY vcpkg.json CMakeLists.txt ./
 COPY src/ ./src/
+COPY test/ ./test/
 RUN cmake -B build \
     -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
     -DCMAKE_BUILD_TYPE=Release
 RUN cmake --build build --config Release
+RUN ctest --test-dir build --output-on-failure
 
 # Stage 4: Runtime
 FROM ubuntu:24.04
