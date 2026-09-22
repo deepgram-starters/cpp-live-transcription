@@ -23,7 +23,7 @@ std::string build_deepgram_path(const std::string& query_string) {
         {"punctuate",       "true"},
         {"diarize",         "false"},
         {"filler_words",    "false"},
-        {"interim_results", "true"},
+        {"interim_results", "false"},
         {"encoding",        "linear16"},
         {"sample_rate",     "16000"},
         {"channels",        "1"},
