@@ -15,12 +15,15 @@
 #include <nlohmann/json.hpp>
 #include <toml++/toml.hpp>
 
+#include "deepgram_path.h"
+
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/asio/ssl/host_name_verification.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
@@ -32,6 +35,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -340,45 +344,6 @@ static json load_metadata() {
 // WEBSOCKET PROXY - Outbound connection to Deepgram via Boost.Beast
 // ============================================================================
 
-/// Builds the Deepgram WebSocket URL path with query parameters forwarded from the client request.
-static std::string build_deepgram_path(const std::string& query_string) {
-    // Parse incoming query params
-    std::map<std::string, std::string> params;
-    std::istringstream qs(query_string);
-    std::string pair;
-    while (std::getline(qs, pair, '&')) {
-        auto eq = pair.find('=');
-        if (eq != std::string::npos) {
-            params[pair.substr(0, eq)] = pair.substr(eq + 1);
-        }
-    }
-
-    // Defaults for Deepgram query parameters
-    std::vector<std::pair<std::string, std::string>> defaults = {
-        {"model",        "nova-3"},
-        {"language",     "en"},
-        {"smart_format", "true"},
-        {"punctuate",    "true"},
-        {"diarize",      "false"},
-        {"filler_words", "false"},
-        {"encoding",     "linear16"},
-        {"sample_rate",  "16000"},
-        {"channels",     "1"}
-    };
-
-    std::string path = "/v1/listen?";
-    bool first = true;
-    for (auto& [name, default_val] : defaults) {
-        auto it = params.find(name);
-        const std::string& val = (it != params.end()) ? it->second : default_val;
-        if (!first) path += "&";
-        path += name + "=" + val;
-        first = false;
-    }
-
-    return path;
-}
-
 /// Parses the Sec-WebSocket-Protocol header value into individual protocol strings.
 static std::vector<std::string> parse_subprotocols(const std::string& header_value) {
     std::vector<std::string> protocols;
@@ -409,19 +374,29 @@ static std::string get_param(const std::string& query_string, const std::string&
     return default_val;
 }
 
+struct ConnState {
+    // Members are destroyed in reverse declaration order. The socket references
+    // both contexts, so it must be destroyed before either context.
+    std::shared_ptr<net::io_context> ioc;
+    std::shared_ptr<ssl::context> ssl_ctx;
+    std::shared_ptr<websocket::stream<beast::ssl_stream<tcp::socket>>> dg_ws;
+    std::shared_ptr<std::atomic<bool>> closed;
+    std::shared_ptr<std::atomic<int64_t>> client_to_dg_count;
+    std::shared_ptr<std::atomic<int64_t>> dg_to_client_count;
+    crow::websocket::connection* client_conn;
+    std::mutex client_write_mutex;
+    std::mutex dg_write_mutex;
+};
+
 /// Runs the outbound WebSocket read loop on a dedicated thread.
 /// Reads messages from Deepgram and forwards them to the client via Crow's WebSocket.
-static void deepgram_read_loop(
-    std::shared_ptr<websocket::stream<beast::ssl_stream<tcp::socket>>> dg_ws,
-    crow::websocket::connection* client_conn,
-    std::shared_ptr<std::atomic<bool>> closed,
-    std::shared_ptr<std::atomic<int64_t>> dg_to_client_count)
+static void deepgram_read_loop(std::shared_ptr<ConnState> state)
 {
     try {
-        while (!closed->load()) {
+        while (!state->closed->load()) {
             beast::flat_buffer buffer;
             boost::system::error_code ec;
-            dg_ws->read(buffer, ec);
+            state->dg_ws->read(buffer, ec);
 
             if (ec) {
                 if (ec != websocket::error::closed &&
@@ -435,13 +410,16 @@ static void deepgram_read_loop(
             auto data = buffer.data();
             std::string msg(static_cast<const char*>(data.data()), data.size());
 
-            int64_t count = dg_to_client_count->fetch_add(1) + 1;
+            int64_t count = state->dg_to_client_count->fetch_add(1) + 1;
 
-            if (dg_ws->got_text()) {
+            if (state->dg_ws->got_text()) {
                 std::cout << "[deepgram->client] message #" << count
                           << " (binary: false, size: " << msg.size() << ")" << std::endl;
                 try {
-                    client_conn->send_text(msg);
+                    // onclose takes this lock before invalidating client_conn.
+                    std::lock_guard<std::mutex> lock(state->client_write_mutex);
+                    if (state->closed->load() || !state->client_conn) break;
+                    state->client_conn->send_text(msg);
                 } catch (...) {
                     std::cerr << "[deepgram->client] write error" << std::endl;
                     break;
@@ -452,7 +430,9 @@ static void deepgram_read_loop(
                               << " (binary: true, size: " << msg.size() << ")" << std::endl;
                 }
                 try {
-                    client_conn->send_binary(msg);
+                    std::lock_guard<std::mutex> lock(state->client_write_mutex);
+                    if (state->closed->load() || !state->client_conn) break;
+                    state->client_conn->send_binary(msg);
                 } catch (...) {
                     std::cerr << "[deepgram->client] write error" << std::endl;
                     break;
@@ -460,12 +440,12 @@ static void deepgram_read_loop(
             }
         }
     } catch (const std::exception& e) {
-        if (!closed->load()) {
+        if (!state->closed->load()) {
             std::cerr << "[deepgram->client] exception: " << e.what() << std::endl;
         }
     }
 
-    closed->store(true);
+    state->closed->store(true);
 }
 
 // ============================================================================
@@ -599,9 +579,6 @@ int main() {
             std::string valid_proto = data->substr(0, null_pos);
             std::string query_string = data->substr(null_pos + 1);
 
-            // Set the accepted subprotocol on the response
-            conn.send_text(""); // Trigger connection -- the protocol is set via the upgrade response
-
             std::cout << "Client connected to /api/live-transcription" << std::endl;
 
             // Build Deepgram URL path with forwarded query parameters
@@ -628,7 +605,8 @@ int main() {
             auto ioc = std::make_shared<net::io_context>();
             auto ssl_ctx = std::make_shared<ssl::context>(ssl::context::tlsv12_client);
             ssl_ctx->set_default_verify_paths();
-            ssl_ctx->set_verify_mode(ssl::verify_none); // Deepgram uses valid certs but simplify for starter
+            ssl_ctx->set_verify_mode(ssl::verify_peer);
+            ssl_ctx->set_verify_callback(ssl::host_name_verification("api.deepgram.com"));
 
             std::shared_ptr<websocket::stream<beast::ssl_stream<tcp::socket>>> dg_ws;
 
@@ -663,49 +641,34 @@ int main() {
 
             } catch (const std::exception& e) {
                 std::cerr << "Failed to connect to Deepgram: " << e.what() << std::endl;
-                conn.close("Failed to connect to Deepgram");
+                conn.userdata(nullptr);
                 delete data;
+                conn.close("Failed to connect to Deepgram");
                 return;
             }
 
             // Store connection state as userdata (replace the old string)
-            struct ConnState {
-                std::shared_ptr<websocket::stream<beast::ssl_stream<tcp::socket>>> dg_ws;
-                std::shared_ptr<std::atomic<bool>> closed;
-                std::shared_ptr<std::atomic<int64_t>> client_to_dg_count;
-                std::shared_ptr<std::atomic<int64_t>> dg_to_client_count;
-                std::shared_ptr<net::io_context> ioc;
-                std::shared_ptr<ssl::context> ssl_ctx;
-                std::thread read_thread;
-                std::mutex dg_write_mutex;
-            };
-
-            auto* state = new ConnState{
-                dg_ws, closed, client_to_dg_count, dg_to_client_count, ioc, ssl_ctx, {}, {}
-            };
+            auto state = std::make_shared<ConnState>();
+            state->ioc = ioc;
+            state->ssl_ctx = ssl_ctx;
+            state->dg_ws = dg_ws;
+            state->closed = closed;
+            state->client_to_dg_count = client_to_dg_count;
+            state->dg_to_client_count = dg_to_client_count;
+            state->client_conn = &conn;
+            auto* state_handle = new std::shared_ptr<ConnState>(state);
 
             delete data;
-            conn.userdata(state);
+            conn.userdata(state_handle);
 
-            // Start the Deepgram read loop on a separate thread
-            state->read_thread = std::thread(deepgram_read_loop,
-                dg_ws, &conn, closed, dg_to_client_count);
-            state->read_thread.detach();
+            // The reader owns this shared session state until its blocking read exits.
+            std::thread(deepgram_read_loop, *state_handle).detach();
         })
         .onmessage([](crow::websocket::connection& conn, const std::string& msg, bool is_binary) {
             // Forward messages from client to Deepgram
-            struct ConnState {
-                std::shared_ptr<websocket::stream<beast::ssl_stream<tcp::socket>>> dg_ws;
-                std::shared_ptr<std::atomic<bool>> closed;
-                std::shared_ptr<std::atomic<int64_t>> client_to_dg_count;
-                std::shared_ptr<std::atomic<int64_t>> dg_to_client_count;
-                std::shared_ptr<net::io_context> ioc;
-                std::shared_ptr<ssl::context> ssl_ctx;
-                std::thread read_thread;
-                std::mutex dg_write_mutex;
-            };
-
-            auto* state = static_cast<ConnState*>(conn.userdata());
+            auto* state_handle = static_cast<std::shared_ptr<ConnState>*>(conn.userdata());
+            if (!state_handle) return;
+            auto state = *state_handle;
             if (!state || state->closed->load()) return;
 
             int64_t count = state->client_to_dg_count->fetch_add(1) + 1;
@@ -732,31 +695,26 @@ int main() {
         .onclose([](crow::websocket::connection& conn, const std::string& reason, uint16_t) {
             std::cout << "Client disconnected from /api/live-transcription" << std::endl;
 
-            struct ConnState {
-                std::shared_ptr<websocket::stream<beast::ssl_stream<tcp::socket>>> dg_ws;
-                std::shared_ptr<std::atomic<bool>> closed;
-                std::shared_ptr<std::atomic<int64_t>> client_to_dg_count;
-                std::shared_ptr<std::atomic<int64_t>> dg_to_client_count;
-                std::shared_ptr<net::io_context> ioc;
-                std::shared_ptr<ssl::context> ssl_ctx;
-                std::thread read_thread;
-                std::mutex dg_write_mutex;
-            };
+            auto* state_handle = static_cast<std::shared_ptr<ConnState>*>(conn.userdata());
+            if (!state_handle) return;
+            auto state = *state_handle;
 
-            auto* state = static_cast<ConnState*>(conn.userdata());
-            if (!state) return;
-
-            state->closed->store(true);
+            {
+                std::lock_guard<std::mutex> lock(state->client_write_mutex);
+                state->closed->store(true);
+                state->client_conn = nullptr;
+            }
 
             // Cancel the underlying socket to interrupt the read_thread,
             // then let the read loop handle the close gracefully.
             std::cout << "Proxy session ending, closing connections" << std::endl;
             try {
+                std::lock_guard<std::mutex> lock(state->dg_write_mutex);
                 beast::get_lowest_layer(*state->dg_ws).cancel();
             } catch (...) {}
 
-            // Clean up (detached thread will exit on its own when closed flag is set)
-            delete state;
+            // The detached reader retains state until its canceled read returns.
+            delete state_handle;
             conn.userdata(nullptr);
         });
 

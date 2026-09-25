@@ -1,7 +1,7 @@
 # C++ Live Transcription Makefile
 # Framework-agnostic commands for managing the project and git submodules
 
-.PHONY: help check check-prereqs init install install-frontend build start start-backend start-frontend test update clean status eject-frontend
+.PHONY: help check check-prereqs init install install-frontend build start start-backend start-frontend test unit-test update clean status eject-frontend
 
 # Default target: show help
 help:
@@ -118,6 +118,10 @@ test:
 	fi
 	@echo "==> Running contract conformance tests..."
 	@bash contracts/tests/run-live-transcription-app.sh
+
+# Build the shipping image; its C++ stage runs CTest and all stages are exercised.
+unit-test:
+	docker build -f deploy/Dockerfile .
 
 # Update submodules to latest commits
 update:
