@@ -23,6 +23,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/asio/ssl/host_name_verification.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
@@ -374,12 +375,14 @@ static std::string get_param(const std::string& query_string, const std::string&
 }
 
 struct ConnState {
+    // Members are destroyed in reverse declaration order. The socket references
+    // both contexts, so it must be destroyed before either context.
+    std::shared_ptr<net::io_context> ioc;
+    std::shared_ptr<ssl::context> ssl_ctx;
     std::shared_ptr<websocket::stream<beast::ssl_stream<tcp::socket>>> dg_ws;
     std::shared_ptr<std::atomic<bool>> closed;
     std::shared_ptr<std::atomic<int64_t>> client_to_dg_count;
     std::shared_ptr<std::atomic<int64_t>> dg_to_client_count;
-    std::shared_ptr<net::io_context> ioc;
-    std::shared_ptr<ssl::context> ssl_ctx;
     crow::websocket::connection* client_conn;
     std::mutex client_write_mutex;
     std::mutex dg_write_mutex;
@@ -602,7 +605,8 @@ int main() {
             auto ioc = std::make_shared<net::io_context>();
             auto ssl_ctx = std::make_shared<ssl::context>(ssl::context::tlsv12_client);
             ssl_ctx->set_default_verify_paths();
-            ssl_ctx->set_verify_mode(ssl::verify_none); // Deepgram uses valid certs but simplify for starter
+            ssl_ctx->set_verify_mode(ssl::verify_peer);
+            ssl_ctx->set_verify_callback(ssl::host_name_verification("api.deepgram.com"));
 
             std::shared_ptr<websocket::stream<beast::ssl_stream<tcp::socket>>> dg_ws;
 
@@ -645,12 +649,12 @@ int main() {
 
             // Store connection state as userdata (replace the old string)
             auto state = std::make_shared<ConnState>();
+            state->ioc = ioc;
+            state->ssl_ctx = ssl_ctx;
             state->dg_ws = dg_ws;
             state->closed = closed;
             state->client_to_dg_count = client_to_dg_count;
             state->dg_to_client_count = dg_to_client_count;
-            state->ioc = ioc;
-            state->ssl_ctx = ssl_ctx;
             state->client_conn = &conn;
             auto* state_handle = new std::shared_ptr<ConnState>(state);
 

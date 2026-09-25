@@ -1,8 +1,11 @@
 # Stage 1: Build custom Caddy with rate limiting module
 FROM golang:1.23-alpine AS caddy-builder
 WORKDIR /build
-RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-RUN xcaddy build v2.9.1 --with github.com/mholt/caddy-ratelimit
+ARG XCADDY_VERSION=v0.4.5
+ARG CADDY_VERSION=v2.9.1
+ARG CADDY_RATELIMIT_VERSION=v0.1.0
+RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION}
+RUN xcaddy build ${CADDY_VERSION} --with github.com/mholt/caddy-ratelimit@${CADDY_RATELIMIT_VERSION}
 # Binary output: /build/caddy
 
 # Stage 2: Build frontend
